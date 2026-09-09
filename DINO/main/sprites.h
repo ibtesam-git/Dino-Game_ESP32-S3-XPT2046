@@ -6,7 +6,7 @@
 /* ============================================================
  * All the pixel-art shapes the game draws.
  * A "1" is a filled pixel, "0" is empty (background shows through).
- * These get scaled up (usually x2) before being drawn on screen.
+ * These get scaled up before being drawn on screen.
  * ============================================================ */
 
 /* Standing dino, 16 wide x 16 tall */
@@ -56,8 +56,12 @@ static const uint8_t obstacle_sprite[20][12] = {
     {0,0,0,0,0,1,1,0,0,0,0,0},{0,0,0,0,0,1,1,0,0,0,0,0}
 };
 
-/* Flying bird obstacle, 20 wide x 12 tall — this is the new hurdle
- * you have to crouch under instead of jump over. */
+/* Flying bird obstacle, 20 wide x 12 tall.
+ * Two frames — wings-up and wings-down — that game.c alternates
+ * between at a fixed interval to fake a flapping animation, the
+ * same trick the original Chrome dino game's pterodactyl uses. */
+
+/* Frame A: wings spread up and out. */
 static const uint8_t bird_sprite[12][20] = {
     {0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0},
     {0,0,1,1,1,1,0,0,0,0,0,0,0,0,0,1,1,1,1,0},
@@ -65,6 +69,24 @@ static const uint8_t bird_sprite[12][20] = {
     {1,1,1,0,0,0,1,1,0,0,0,0,1,1,0,0,0,1,1,1},
     {0,1,1,0,0,0,0,1,1,1,1,1,1,0,0,0,0,1,1,0},
     {0,0,1,0,0,0,0,0,1,1,1,1,0,0,0,0,0,1,0,0},
+    {0,0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,1,1,1,1,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
+};
+
+/* Frame B: wings folded down toward the body. Same silhouette
+ * width/height as frame A so the obstacle's hitbox never changes,
+ * only the pixels swap. */
+static const uint8_t bird_sprite_flap[12][20] = {
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,1,1,0,0,0,0,0,0,0,0,1,1,0,0,0,0},
+    {0,0,0,1,1,1,1,0,0,0,0,0,0,1,1,1,1,0,0,0},
+    {0,0,1,1,0,0,1,1,0,0,0,0,1,1,0,0,1,1,0,0},
+    {0,1,1,0,0,0,0,1,1,0,0,1,1,0,0,0,0,1,1,0},
     {0,0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0},
     {0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0},
     {0,0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0},

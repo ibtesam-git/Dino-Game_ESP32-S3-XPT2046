@@ -1,10 +1,11 @@
 /* ============================================================
  * GAME LOGIC
  * Everything about the dino, obstacles, physics, and drawing the
- * game state lives here. This file calls tft_driver.h to draw and
- * joystick_driver.h to read input — it never touches GPIO/SPI/ADC
- * directly. That's the whole point of splitting the files:
- * to add a new obstacle or tweak jump height, you only edit THIS file.
+ * game state lives here. This file calls tft_driver.h to draw,
+ * joystick_driver.h to read input, and buzzer_driver.h to play
+ * sound — it never touches GPIO/SPI/ADC/PWM directly. That's the
+ * whole point of splitting the files: to add a new obstacle or
+ * tweak jump height, you only edit THIS file.
  * ============================================================ */
 
 #include <string.h>
@@ -17,6 +18,7 @@
 
 #include "tft_driver.h"
 #include "joystick_driver.h"
+#include "buzzer_driver.h"
 #include "sprites.h"
 #include "game.h"
 
@@ -42,12 +44,20 @@ static const char *TAG = "GAME";
 #define DINO_CROUCH_H         (8 * DINO_CROUCH_SCALE)   /* 16 */
 #define DINO_CROUCH_TOP       (GROUND_Y - DINO_CROUCH_H)
 
-/* --- Flying bird obstacle --- */
-#define BIRD_SCALE      6                   /* bigger + taller so it reaches your jump peak */
-#define BIRD_RENDER_W   (20 * BIRD_SCALE)   /* 120 */
-#define BIRD_RENDER_H   (12 * BIRD_SCALE)   /* 72 */
-#define BIRD_BOTTOM_Y   (GROUND_Y - 20)     /* same low bottom edge, near head height */
-#define BIRD_TOP_Y      (BIRD_BOTTOM_Y - BIRD_RENDER_H)
+/* --- Flying bird obstacle ---
+ * Birds keep the same size, but their vertical position changes.
+ * LOW birds require crouching, MID birds require a timed jump, and
+ * HIGH birds can be passed by simply running underneath. */
+#define BIRD_SCALE          2
+#define BIRD_RENDER_W       (20 * BIRD_SCALE)          /* 40 */
+#define BIRD_RENDER_H       (12 * BIRD_SCALE)          /* 24 */
+#define BIRD_LOW_TOP_Y      (GROUND_Y - 16 - BIRD_RENDER_H)
+/* The middle bird's bottom is aligned with the top of the standing
+ * dino, where the dino's face/head begins. It therefore blocks a
+ * standing dino but leaves the crouching dino underneath it. */
+#define BIRD_MID_TOP_Y      (DINO_GROUND_TOP - BIRD_RENDER_H)
+#define BIRD_HIGH_TOP_Y     (GROUND_Y - 72 - BIRD_RENDER_H)
+#define BIRD_FLAP_PERIOD_MS 150                        /* wing-flap animation speed */
 
 /* Birds only start showing up once the game has been running a
  * while, and only some of the time. Tune these to change difficulty. */
@@ -70,11 +80,13 @@ typedef struct {
 } dino_t;
 
 typedef enum { OBSTACLE_GROUND, OBSTACLE_BIRD } obstacle_type_t;
+typedef enum { BIRD_LOW, BIRD_MID, BIRD_HIGH } bird_height_t;
 
 typedef struct {
     float x;
     int16_t width, height;
     obstacle_type_t type;
+    bird_height_t bird_height;
     bool active;
     rect_t previous;
 } obstacle_t;
@@ -86,6 +98,7 @@ static obstacle_t obstacles[MAX_OBSTACLES];
 static game_state_t game_state = READY;
 
 static uint32_t score = 0;
+static uint32_t high_score = 0;
 static uint32_t displayed_score = 0;
 static float elapsed_game_seconds = 0.0f;
 static bool first_render = true;
@@ -98,7 +111,14 @@ static int rand_range(int lo, int hi) { /* random int in [lo, hi) */
 }
 
 static int16_t obstacle_top_y(const obstacle_t *o) {
-    return (o->type == OBSTACLE_BIRD) ? BIRD_TOP_Y : (int16_t)(GROUND_Y - o->height);
+    if (o->type == OBSTACLE_BIRD) {
+        switch (o->bird_height) {
+            case BIRD_LOW:  return BIRD_LOW_TOP_Y;
+            case BIRD_MID:  return BIRD_MID_TOP_Y;
+            case BIRD_HIGH: return BIRD_HIGH_TOP_Y;
+        }
+    }
+    return (int16_t)(GROUND_Y - o->height);
 }
 
 static rect_t dino_rect(void) {
@@ -167,12 +187,21 @@ static void spawn_obstacle_if_needed(void) {
                 obstacles[i].type   = OBSTACLE_BIRD;
                 obstacles[i].width  = BIRD_RENDER_W;
                 obstacles[i].height = BIRD_RENDER_H;
+                /* Weighted positions: high birds are rare, middle birds
+                 * are the most common, and low birds keep their normal
+                 * chance. The bird size is not changed. */
+                int bird_roll = rand_range(0, 10);
+                obstacles[i].bird_height = (bird_roll == 0) ? BIRD_HIGH
+                    : (bird_roll < 7 ? BIRD_MID : BIRD_LOW);
             } else {
                 obstacles[i].type   = OBSTACLE_GROUND;
                 obstacles[i].width  = 24;
                 obstacles[i].height = (rand_range(0, 3) == 0) ? 52 : 40;
             }
 
+            /* minX keeps every obstacle (bird included) spawning fully
+             * off the right edge of the 480px-wide screen, so it always
+             * enters by flying/scrolling in from the right. */
             float minX = 510.0f;
             float candidate = furthest + (float)rand_range(175, 275);
             obstacles[i].x = candidate > minX ? candidate : minX;
@@ -189,13 +218,20 @@ static void update_physics(float dt, bool jump_flag, bool crouch_held) {
     if (game_state != PLAYING) return;
 
     elapsed_game_seconds += dt;
-    score = (uint32_t)(elapsed_game_seconds * 50.0f);
+    /* Ten times the original score rate: 500 points per second. */
+    score = (uint32_t)(elapsed_game_seconds * 500.0f);
+    if (score > high_score) high_score = score;
 
     bool on_ground = !dino.jumping;
 
     /* Crouching only works while standing on the ground — you can't
-     * duck mid-air in this version. */
-    dino.crouching = on_ground && crouch_held;
+     * duck mid-air in this version. Beep once on the rising edge
+     * (the moment you start crouching), not every frame it's held. */
+    bool new_crouching = on_ground && crouch_held;
+    if (new_crouching && !dino.crouching) {
+        buzzer_play_crouch();
+    }
+    dino.crouching = new_crouching;
 
     if (dino.crouching) {
         dino.y = DINO_CROUCH_TOP;
@@ -211,8 +247,11 @@ static void update_physics(float dt, bool jump_flag, bool crouch_held) {
         if (jump_flag && !dino.jumping) {
             dino.velocityY = JUMP_VELOCITY;
             dino.jumping = true;
+            buzzer_play_jump();
         }
     }
+
+    game_state_t state_before_collisions = game_state;
 
     float speed = current_speed();
     for (int i = 0; i < MAX_OBSTACLES; i++) {
@@ -221,6 +260,11 @@ static void update_physics(float dt, bool jump_flag, bool crouch_held) {
         if (obstacles[i].x + obstacles[i].width < 0) obstacles[i].active = false;
         if (intersects(dino_rect(), obstacle_rect(&obstacles[i]))) game_state = GAME_OVER;
     }
+
+    if (game_state == GAME_OVER && state_before_collisions != GAME_OVER) {
+        buzzer_play_game_over();
+    }
+
     spawn_obstacle_if_needed();
 }
 
@@ -233,6 +277,30 @@ static void draw_score(void) {
     tft_fill_rect(350, 8, 118, 20, BG_COLOR);
     tft_draw_text("SCORE", 350, 8, 2, WHITE);
     tft_draw_text(text, 420, 8, 2, WHITE);
+}
+
+static void draw_game_over_panel(void) {
+    char score_text[7];
+    char high_text[7];
+    uint32_t shown_score = score > 999999 ? 999999 : score;
+    uint32_t shown_high = high_score > 999999 ? 999999 : high_score;
+
+    for (int i = 5; i >= 0; i--) {
+        score_text[i] = '0' + (shown_score % 10);
+        shown_score /= 10;
+        high_text[i] = '0' + (shown_high % 10);
+        shown_high /= 10;
+    }
+    score_text[6] = '\0';
+    high_text[6] = '\0';
+
+    tft_fill_rect(105, 100, 275, 112, BG_COLOR);
+    tft_draw_text("GAME OVER", 160, 108, 3, WHITE);
+    tft_draw_text("SCORE", 130, 145, 2, LIGHTGREY);
+    tft_draw_text(score_text, 250, 145, 2, WHITE);
+    tft_draw_text("HIGH SCORE", 130, 163, 2, LIGHTGREY);
+    tft_draw_text(high_text, 250, 163, 2, WHITE);
+    tft_draw_text("PRESS TO RESTART", 135, 190, 2, LIGHTGREY);
 }
 
 static void draw_static_scene(void) {
@@ -262,8 +330,13 @@ static void render_dynamic(void) {
     bool state_changed = game_state != last_rendered_state;
     clear_previous_dynamic();
 
+    /* A new run must clear the complete previous screen. The game-over
+     * panel is larger than the moving-object erase rectangles, so erasing
+     * only the old sprite locations leaves stale text behind until a new
+     * object happens to pass over it. Redraw the whole static scene when
+     * leaving READY or GAME_OVER, before drawing the new frame. */
     if (state_changed && (last_rendered_state == GAME_OVER || last_rendered_state == READY)) {
-        tft_fill_rect(120, 112, 250, 80, BG_COLOR);
+        draw_static_scene();
     }
 
     if (game_state == READY) {
@@ -282,11 +355,19 @@ static void render_dynamic(void) {
                 (int16_t)dino.x, (int16_t)dino.y, 2, DINO_COLOR);
         }
 
+        /* Flip between the two bird frames on a fixed timer so it
+         * reads as flapping wings instead of a static image sliding
+         * across the screen. */
+        bool wing_up = ((esp_timer_get_time() / 1000) % (BIRD_FLAP_PERIOD_MS * 2))
+                       < BIRD_FLAP_PERIOD_MS;
+        const uint8_t *bird_frame = wing_up ? &bird_sprite[0][0] : &bird_sprite_flap[0][0];
+
         for (int i = 0; i < MAX_OBSTACLES; i++) {
             if (!obstacles[i].active) continue;
             if (obstacles[i].type == OBSTACLE_BIRD) {
-                tft_draw_sprite_scaled(&bird_sprite[0][0], 20, 12,
-                    (int16_t)obstacles[i].x, BIRD_TOP_Y, BIRD_SCALE, OBSTACLE_COLOR);
+                tft_draw_sprite_scaled(bird_frame, 20, 12,
+                    (int16_t)obstacles[i].x, obstacle_top_y(&obstacles[i]),
+                    BIRD_SCALE, OBSTACLE_COLOR);
             } else {
                 tft_draw_sprite_scaled(&obstacle_sprite[0][0], 12, 20,
                     (int16_t)obstacles[i].x, GROUND_Y - obstacles[i].height, 2, OBSTACLE_COLOR);
@@ -295,9 +376,7 @@ static void render_dynamic(void) {
     }
 
     if (game_state == GAME_OVER && state_changed) {
-        tft_fill_rect(120, 112, 250, 80, BG_COLOR);
-        tft_draw_text("GAME OVER", 160, 120, 3, WHITE);
-        tft_draw_text("PRESS TO RESTART", 135, 165, 2, LIGHTGREY);
+        draw_game_over_panel();
     }
 
     int16_t dh = dino.crouching ? DINO_CROUCH_H : DINO_H;
