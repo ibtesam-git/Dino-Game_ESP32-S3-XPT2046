@@ -6,6 +6,10 @@
  * sound — it never touches GPIO/SPI/ADC/PWM directly. That's the
  * whole point of splitting the files: to add a new obstacle or
  * tweak jump height, you only edit THIS file.
+ *
+ * All actual colors live in colors.h, not here — this file only
+ * refers to them by name (BG_COLOR, DINO_COLOR, etc.) so retheming
+ * the game never requires touching game logic.
  * ============================================================ */
 
 #include <string.h>
@@ -19,6 +23,7 @@
 #include "tft_driver.h"
 #include "joystick_driver.h"
 #include "buzzer_driver.h"
+#include "colors.h"
 #include "sprites.h"
 #include "game.h"
 
@@ -45,18 +50,15 @@ static const char *TAG = "GAME";
 #define DINO_CROUCH_TOP       (GROUND_Y - DINO_CROUCH_H)
 
 /* --- Flying bird obstacle ---
- * Birds keep the same size, but their vertical position changes.
- * LOW birds require crouching, MID birds require a timed jump, and
- * HIGH birds can be passed by simply running underneath. */
+ * Small and low: it flies at roughly head height, just above where
+ * the crouched dino sits. Standing dinos get hit, crouched dinos
+ * pass clean underneath, and a well-timed jump can still clear it —
+ * same idea as the pterodactyl in the original Chrome dino game. */
 #define BIRD_SCALE          2
 #define BIRD_RENDER_W       (20 * BIRD_SCALE)          /* 40 */
 #define BIRD_RENDER_H       (12 * BIRD_SCALE)          /* 24 */
-#define BIRD_LOW_TOP_Y      (GROUND_Y - 16 - BIRD_RENDER_H)
-/* The middle bird's bottom is aligned with the top of the standing
- * dino, where the dino's face/head begins. It therefore blocks a
- * standing dino but leaves the crouching dino underneath it. */
-#define BIRD_MID_TOP_Y      (DINO_GROUND_TOP - BIRD_RENDER_H)
-#define BIRD_HIGH_TOP_Y     (GROUND_Y - 72 - BIRD_RENDER_H)
+#define BIRD_BOTTOM_Y       (GROUND_Y - 16)            /* just above crouch height */
+#define BIRD_TOP_Y          (BIRD_BOTTOM_Y - BIRD_RENDER_H)
 #define BIRD_FLAP_PERIOD_MS 150                        /* wing-flap animation speed */
 
 /* Birds only start showing up once the game has been running a
@@ -64,10 +66,14 @@ static const char *TAG = "GAME";
 #define BIRD_MIN_ELAPSED_SEC  8.0f
 #define BIRD_SPAWN_ODDS       4   /* 1-in-N chance once eligible */
 
-#define BG_COLOR       BLACK
-#define GROUND_COLOR   WHITE
-#define DINO_COLOR     WHITE
-#define OBSTACLE_COLOR WHITE
+/* ---------------- Palette wiring ----------------
+ * Everything below just points at colors.h. Change the game's look
+ * by editing colors.h, not these lines. */
+#define BG_COLOR       COLOR_SKY      /* also the "erase" color for dynamic sprites */
+#define GROUND_COLOR   COLOR_GROUND_LINE
+#define DINO_COLOR     COLOR_DINO
+#define CACTUS_COLOR   COLOR_CACTUS
+#define BIRD_COLOR     COLOR_BIRD
 
 typedef struct { int16_t x, y, w, h; } rect_t;
 
@@ -80,13 +86,11 @@ typedef struct {
 } dino_t;
 
 typedef enum { OBSTACLE_GROUND, OBSTACLE_BIRD } obstacle_type_t;
-typedef enum { BIRD_LOW, BIRD_MID, BIRD_HIGH } bird_height_t;
 
 typedef struct {
     float x;
     int16_t width, height;
     obstacle_type_t type;
-    bird_height_t bird_height;
     bool active;
     rect_t previous;
 } obstacle_t;
@@ -98,7 +102,6 @@ static obstacle_t obstacles[MAX_OBSTACLES];
 static game_state_t game_state = READY;
 
 static uint32_t score = 0;
-static uint32_t high_score = 0;
 static uint32_t displayed_score = 0;
 static float elapsed_game_seconds = 0.0f;
 static bool first_render = true;
@@ -111,14 +114,7 @@ static int rand_range(int lo, int hi) { /* random int in [lo, hi) */
 }
 
 static int16_t obstacle_top_y(const obstacle_t *o) {
-    if (o->type == OBSTACLE_BIRD) {
-        switch (o->bird_height) {
-            case BIRD_LOW:  return BIRD_LOW_TOP_Y;
-            case BIRD_MID:  return BIRD_MID_TOP_Y;
-            case BIRD_HIGH: return BIRD_HIGH_TOP_Y;
-        }
-    }
-    return (int16_t)(GROUND_Y - o->height);
+    return (o->type == OBSTACLE_BIRD) ? BIRD_TOP_Y : (int16_t)(GROUND_Y - o->height);
 }
 
 static rect_t dino_rect(void) {
@@ -187,12 +183,6 @@ static void spawn_obstacle_if_needed(void) {
                 obstacles[i].type   = OBSTACLE_BIRD;
                 obstacles[i].width  = BIRD_RENDER_W;
                 obstacles[i].height = BIRD_RENDER_H;
-                /* Weighted positions: high birds are rare, middle birds
-                 * are the most common, and low birds keep their normal
-                 * chance. The bird size is not changed. */
-                int bird_roll = rand_range(0, 10);
-                obstacles[i].bird_height = (bird_roll == 0) ? BIRD_HIGH
-                    : (bird_roll < 7 ? BIRD_MID : BIRD_LOW);
             } else {
                 obstacles[i].type   = OBSTACLE_GROUND;
                 obstacles[i].width  = 24;
@@ -218,9 +208,7 @@ static void update_physics(float dt, bool jump_flag, bool crouch_held) {
     if (game_state != PLAYING) return;
 
     elapsed_game_seconds += dt;
-    /* Ten times the original score rate: 500 points per second. */
-    score = (uint32_t)(elapsed_game_seconds * 500.0f);
-    if (score > high_score) high_score = score;
+    score = (uint32_t)(elapsed_game_seconds * 50.0f);
 
     bool on_ground = !dino.jumping;
 
@@ -275,38 +263,16 @@ static void draw_score(void) {
     for (int i = 5; i >= 0; i--) { text[i] = '0' + (shown % 10); shown /= 10; }
     text[6] = '\0';
     tft_fill_rect(350, 8, 118, 20, BG_COLOR);
-    tft_draw_text("SCORE", 350, 8, 2, WHITE);
-    tft_draw_text(text, 420, 8, 2, WHITE);
-}
-
-static void draw_game_over_panel(void) {
-    char score_text[7];
-    char high_text[7];
-    uint32_t shown_score = score > 999999 ? 999999 : score;
-    uint32_t shown_high = high_score > 999999 ? 999999 : high_score;
-
-    for (int i = 5; i >= 0; i--) {
-        score_text[i] = '0' + (shown_score % 10);
-        shown_score /= 10;
-        high_text[i] = '0' + (shown_high % 10);
-        shown_high /= 10;
-    }
-    score_text[6] = '\0';
-    high_text[6] = '\0';
-
-    tft_fill_rect(105, 100, 275, 112, BG_COLOR);
-    tft_draw_text("GAME OVER", 160, 108, 3, WHITE);
-    tft_draw_text("SCORE", 130, 145, 2, LIGHTGREY);
-    tft_draw_text(score_text, 250, 145, 2, WHITE);
-    tft_draw_text("HIGH SCORE", 130, 163, 2, LIGHTGREY);
-    tft_draw_text(high_text, 250, 163, 2, WHITE);
-    tft_draw_text("PRESS TO RESTART", 135, 190, 2, LIGHTGREY);
+    tft_draw_text("SCORE", 350, 8, 2, COLOR_TEXT_DARK);
+    tft_draw_text(text, 420, 8, 2, COLOR_SCORE);
 }
 
 static void draw_static_scene(void) {
     tft_fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, BG_COLOR);
+    /* Sand band under the horizon line — purely cosmetic, drawn once. */
+    tft_fill_rect(0, GROUND_Y + 2, TFT_WIDTH, TFT_HEIGHT - (GROUND_Y + 2), COLOR_SAND);
     tft_fill_rect(0, GROUND_Y, TFT_WIDTH, 2, GROUND_COLOR);
-    tft_draw_text("DINO RUN", 12, 8, 2, LIGHTGREY);
+    tft_draw_text("DINO RUN", 12, 8, 2, COLOR_TEXT_DARK);
     draw_score();
 }
 
@@ -330,29 +296,24 @@ static void render_dynamic(void) {
     bool state_changed = game_state != last_rendered_state;
     clear_previous_dynamic();
 
-    /* A new run must clear the complete previous screen. The game-over
-     * panel is larger than the moving-object erase rectangles, so erasing
-     * only the old sprite locations leaves stale text behind until a new
-     * object happens to pass over it. Redraw the whole static scene when
-     * leaving READY or GAME_OVER, before drawing the new frame. */
     if (state_changed && (last_rendered_state == GAME_OVER || last_rendered_state == READY)) {
-        draw_static_scene();
+        tft_fill_rect(120, 112, 250, 80, BG_COLOR);
     }
 
     if (game_state == READY) {
-        tft_draw_sprite_scaled(&dino_sprite[0][0], 16, 16, DINO_X, DINO_GROUND_TOP, 2, DINO_COLOR);
+        tft_draw_sprite_scaled(&dino_sprite[0][0], 16, 16, DINO_X, DINO_GROUND_TOP, 2, DINO_COLOR, BG_COLOR);
         if (state_changed) {
             tft_fill_rect(120, 112, 250, 80, BG_COLOR);
-            tft_draw_text("PRESS JOYSTICK", 145, 125, 2, WHITE);
-            tft_draw_text("UP OR BUTTON", 155, 145, 2, LIGHTGREY);
+            tft_draw_text("PRESS JOYSTICK", 145, 125, 2, COLOR_TEXT_DARK);
+            tft_draw_text("UP OR BUTTON", 155, 145, 2, COLOR_TEXT_MUTED);
         }
     } else {
         if (dino.crouching) {
             tft_draw_sprite_scaled(&dino_crouch_sprite[0][0], 16, 8,
-                (int16_t)dino.x, (int16_t)dino.y, DINO_CROUCH_SCALE, DINO_COLOR);
+                (int16_t)dino.x, (int16_t)dino.y, DINO_CROUCH_SCALE, DINO_COLOR, BG_COLOR);
         } else {
             tft_draw_sprite_scaled(&dino_sprite[0][0], 16, 16,
-                (int16_t)dino.x, (int16_t)dino.y, 2, DINO_COLOR);
+                (int16_t)dino.x, (int16_t)dino.y, 2, DINO_COLOR, BG_COLOR);
         }
 
         /* Flip between the two bird frames on a fixed timer so it
@@ -366,17 +327,18 @@ static void render_dynamic(void) {
             if (!obstacles[i].active) continue;
             if (obstacles[i].type == OBSTACLE_BIRD) {
                 tft_draw_sprite_scaled(bird_frame, 20, 12,
-                    (int16_t)obstacles[i].x, obstacle_top_y(&obstacles[i]),
-                    BIRD_SCALE, OBSTACLE_COLOR);
+                    (int16_t)obstacles[i].x, BIRD_TOP_Y, BIRD_SCALE, BIRD_COLOR, BG_COLOR);
             } else {
                 tft_draw_sprite_scaled(&obstacle_sprite[0][0], 12, 20,
-                    (int16_t)obstacles[i].x, GROUND_Y - obstacles[i].height, 2, OBSTACLE_COLOR);
+                    (int16_t)obstacles[i].x, GROUND_Y - obstacles[i].height, 2, CACTUS_COLOR, BG_COLOR);
             }
         }
     }
 
     if (game_state == GAME_OVER && state_changed) {
-        draw_game_over_panel();
+        tft_fill_rect(120, 112, 250, 80, BG_COLOR);
+        tft_draw_text("GAME OVER", 160, 120, 3, COLOR_DANGER);
+        tft_draw_text("PRESS TO RESTART", 135, 165, 2, COLOR_TEXT_MUTED);
     }
 
     int16_t dh = dino.crouching ? DINO_CROUCH_H : DINO_H;

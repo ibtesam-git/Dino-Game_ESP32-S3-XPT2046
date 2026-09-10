@@ -85,13 +85,14 @@ void tft_fill_rect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color) {
 }
 
 void tft_draw_sprite_scaled(const uint8_t *sprite, uint8_t sw, uint8_t sh,
-                             int16_t x, int16_t y, uint8_t scale, uint16_t color) {
+                             int16_t x, int16_t y, uint8_t scale,
+                             uint16_t fg_color, uint16_t bg_color) {
     int16_t w = sw * scale, h = sh * scale;
     if (x < 0 || y < 0 || x + w > TFT_WIDTH || y + h > TFT_HEIGHT) return;
 
     uint8_t fg[3], bg[3];
-    rgb565_to_666_bytes(color, fg);
-    rgb565_to_666_bytes(BLACK, bg);
+    rgb565_to_666_bytes(fg_color, fg);
+    rgb565_to_666_bytes(bg_color, bg);
 
     tft_set_addr_window(x, y, x + w - 1, y + h - 1);
     gpio_set_level(TFT_DC, 1);
